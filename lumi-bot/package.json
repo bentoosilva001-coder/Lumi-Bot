@@ -1,0 +1,18 @@
+{
+  "name": "lumi-bot",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp do Grupo LumiNex, com o mascote Lumi como cérebro (Claude API) e Baileys como conexão com o WhatsApp.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
