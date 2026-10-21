@@ -50,6 +50,17 @@ const PRICE_PER_OUTPUT_TOKEN = 5 / 1_000_000;
 const DAILY_BUDGET_USD = parseFloat(process.env.DAILY_BUDGET_USD || '1.00');
 const MAX_MESSAGES_PER_HOUR = parseInt(process.env.MAX_MESSAGES_PER_HOUR || '15', 10);
 
+// --- Proteções contra respostas indevidas ---------------------------------
+// Números que o Lumi NUNCA atende (família, amigos, clientes que você atende à mão).
+// Só dígitos, separados por vírgula. Ex.: LUMI_IGNORE_NUMBERS=5598999990000,5598988880000
+const IGNORE_NUMBERS = (process.env.LUMI_IGNORE_NUMBERS || '').split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean);
+// Modo de teste: se preenchido, o Lumi só responde a esses números.
+const ONLY_NUMBERS = (process.env.LUMI_ONLY_NUMBERS || '').split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean);
+// Quando VOCÊ responde uma conversa pelo celular, o Lumi fica quieto nela por este tempo.
+const HUMAN_PAUSE_HOURS = parseFloat(process.env.LUMI_HUMAN_PAUSE_HOURS || '72');
+const pausedUntil = new Map();   // conversa -> até quando o Lumi fica quieto
+const botSentIds = new Set();    // ids das mensagens enviadas pelo próprio bot
+
 // Estado do "cofre": quanto já foi gasto hoje, e quando foi o
 // último reset (pra zerar automaticamente à meia-noite).
 let dailySpend = 0;
@@ -255,13 +266,45 @@ async function startBot() {
   // no disco pra não precisar escanear o QR de novo depois.
   sock.ev.on('creds.update', saveCreds);
 
-  // --- Evento de mensagem recebida: aqui mora o "cérebro" ---
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
+  // Registra o id de tudo que o bot envia, para distinguir de mensagens suas.
+  const _send = sock.sendMessage.bind(sock);
+  sock.sendMessage = async (...args) => {
+    const r = await _send(...args);
+    if (r && r.key && r.key.id) botSentIds.add(r.key.id);
+    return r;
+  };
 
-    // Ignora mensagens vazias e mensagens que O PRÓPRIO BOT enviou
-    // (senão ele ficaria "respondendo a si mesmo" infinitamente).
-    if (!msg.message || msg.key.fromMe) return;
+  // --- Evento de mensagem recebida: aqui mora o "cérebro" ---
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    const msg = messages[0];
+    if (!msg || !msg.message) return;
+    const jid = msg.key.remoteJid || '';
+
+    // Nunca responde em grupos, status/stories, listas de transmissão ou canais.
+    if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+
+    // Mensagem enviada por VOCÊ (pelo celular): você assumiu a conversa, o Lumi pausa nela.
+    // Envie "#retomar" na conversa para reativar o Lumi antes do prazo.
+    if (msg.key.fromMe) {
+      const ownText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase();
+      if (ownText === '#retomar') {
+        pausedUntil.delete(jid);
+        console.log(`▶️ Lumi retomado em ${jid}`);
+        return;
+      }
+      setTimeout(() => {
+        if (botSentIds.has(msg.key.id)) return; // foi o próprio bot, não você
+        pausedUntil.set(jid, Date.now() + HUMAN_PAUSE_HOURS * 3600 * 1000);
+        console.log(`⏸️ Você respondeu em ${jid}: Lumi pausado nessa conversa por ${HUMAN_PAUSE_HOURS}h.`);
+      }, 2500);
+      return;
+    }
+    if (type && type !== 'notify') return; // ignora histórico antigo sincronizado
+
+    const num = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (IGNORE_NUMBERS.some((n) => num.endsWith(n))) { console.log(`🙈 ${num} está na lista de ignorados.`); return; }
+    if (ONLY_NUMBERS.length && !ONLY_NUMBERS.some((n) => num.endsWith(n))) return;
+    if ((pausedUntil.get(jid) || 0) > Date.now()) { console.log(`⏸️ Conversa ${jid} assumida por humano: Lumi quieto.`); return; }
 
     const from = msg.key.remoteJid;
     let text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
