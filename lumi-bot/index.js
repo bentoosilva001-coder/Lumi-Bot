@@ -21,6 +21,8 @@ import QRCode from 'qrcode';
 import Anthropic from '@anthropic-ai/sdk';
 import pino from 'pino';
 import { SYSTEM_PROMPT } from './lumi-persona.js';
+import { PROSPECT_PROMPT, OPTOUT_REGEX, INTEREST_REGEX } from './lumi-prospeccao.js';
+import { readFileSync as _rd, writeFileSync as _wr, existsSync as _ex } from 'fs';
 
 // Cliente da Anthropic — usa a chave que você vai colocar no arquivo .env
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -60,6 +62,41 @@ const ONLY_NUMBERS = (process.env.LUMI_ONLY_NUMBERS || '').split(',').map((n) =>
 const HUMAN_PAUSE_HOURS = parseFloat(process.env.LUMI_HUMAN_PAUSE_HOURS || '72');
 const pausedUntil = new Map();   // conversa -> até quando o Lumi fica quieto
 const botSentIds = new Set();    // ids das mensagens enviadas pelo próprio bot
+
+// --- Modo prospecção: estado salvo em lumi-estado.json (não vai para o GitHub) ---
+// Quando VOCÊ responde um prospect à mão, o Lumi fica quieto só por alguns minutos.
+const HUMAN_PAUSE_PROSPECT_MIN = parseFloat(process.env.LUMI_PROSPECT_PAUSE_MINUTES || '15');
+const ESTADO_FILE = 'lumi-estado.json';
+let estado = { prospects: [], ignorados: [] };
+try { if (_ex(ESTADO_FILE)) estado = { ...estado, ...JSON.parse(_rd(ESTADO_FILE, 'utf8')) }; } catch (e) { console.warn('Não consegui ler lumi-estado.json:', e.message); }
+const salvarEstado = () => { try { _wr(ESTADO_FILE, JSON.stringify(estado, null, 2)); } catch (e) { console.warn('Não consegui salvar lumi-estado.json:', e.message); } };
+const normNum = (j) => String(j || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+const mesmoNum = (lista, num) => lista.some((n) => n && (num.endsWith(n) || n.endsWith(num)));
+const alertaInteresse = new Map();
+const comNumero = (d) => (d.length <= 11 ? '55' + d : d);
+
+// Comandos que VOCÊ digita no seu próprio chat ("Mensagem para você mesmo").
+// Nada disso aparece para clientes.
+async function comandoDono(sock, ownJid, txt) {
+  const [cmd, ...resto] = txt.trim().split(/\s+/);
+  const nums = resto.join(' ').split(/[,;\s]+/).map((n) => n.replace(/\D/g, '')).filter((n) => n.length >= 10).map(comNumero);
+  const say = (t) => sock.sendMessage(ownJid, { text: t });
+  const c = (cmd || '').toLowerCase();
+  if (c === '#prospect' && nums.length) {
+    nums.forEach((n) => { if (!mesmoNum(estado.prospects, n)) estado.prospects.push(n); estado.ignorados = estado.ignorados.filter((i) => !(n.endsWith(i) || i.endsWith(n))); pausedUntil.delete(n + '@s.whatsapp.net'); });
+    salvarEstado();
+    return say(`✅ Modo prospecção ligado para: ${nums.join(', ')}\nQuando responderem, o Lumi conduz a conversa e te avisa se houver interesse.`);
+  }
+  if (c === '#humano' && nums.length) { nums.forEach((n) => pausedUntil.set(n + '@s.whatsapp.net', Date.now() + HUMAN_PAUSE_HOURS * 3600 * 1000)); return say(`⏸️ Lumi pausado por ${HUMAN_PAUSE_HOURS}h em: ${nums.join(', ')}`); }
+  if (c === '#retomar' && nums.length) { nums.forEach((n) => pausedUntil.delete(n + '@s.whatsapp.net')); return say(`▶️ Lumi retomado em: ${nums.join(', ')}`); }
+  if (c === '#ignorar' && nums.length) {
+    nums.forEach((n) => { if (!mesmoNum(estado.ignorados, n)) estado.ignorados.push(n); estado.prospects = estado.prospects.filter((p) => !(n.endsWith(p) || p.endsWith(n))); });
+    salvarEstado();
+    return say(`🙈 O Lumi nunca mais responde: ${nums.join(', ')}`);
+  }
+  if (c === '#lista') return say(`📋 Prospects (${estado.prospects.length}): ${estado.prospects.join(', ') || 'nenhum'}\n🙈 Ignorados (${estado.ignorados.length}): ${estado.ignorados.join(', ') || 'nenhum'}`);
+  return say('Comandos (um ou mais números, com DDD):\n#prospect 5598999990000 → Lumi conduz a conversa depois que responderem\n#humano 5598999990000 → Lumi quieto nessa conversa\n#retomar 5598999990000 → Lumi volta\n#ignorar 5598999990000 → Lumi nunca responde\n#lista → ver prospects e ignorados');
+}
 
 // Estado do "cofre": quanto já foi gasto hoje, e quando foi o
 // último reset (pra zerar automaticamente à meia-noite).
@@ -283,26 +320,30 @@ async function startBot() {
     // Nunca responde em grupos, status/stories, listas de transmissão ou canais.
     if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
 
-    // Mensagem enviada por VOCÊ (pelo celular): você assumiu a conversa, o Lumi pausa nela.
-    // Envie "#retomar" na conversa para reativar o Lumi antes do prazo.
+    // Mensagens enviadas por VOCÊ (pelo celular).
     if (msg.key.fromMe) {
-      const ownText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase();
-      if (ownText === '#retomar') {
-        pausedUntil.delete(jid);
-        console.log(`▶️ Lumi retomado em ${jid}`);
+      const ownText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
+      const ownNum = normNum(sock.user?.id);
+      const ownLid = normNum(sock.user?.lid);
+      // 1) "Mensagem para você mesmo" = painel de comandos (clientes nunca veem).
+      if (ownText.startsWith('#') && (normNum(jid) === ownNum || (ownLid && normNum(jid) === ownLid))) {
+        await comandoDono(sock, jid, ownText);
         return;
       }
+      // 2) Você respondeu um cliente à mão: o Lumi pausa nessa conversa.
       setTimeout(() => {
         if (botSentIds.has(msg.key.id)) return; // foi o próprio bot, não você
-        pausedUntil.set(jid, Date.now() + HUMAN_PAUSE_HOURS * 3600 * 1000);
-        console.log(`⏸️ Você respondeu em ${jid}: Lumi pausado nessa conversa por ${HUMAN_PAUSE_HOURS}h.`);
+        const ms = mesmoNum(estado.prospects, normNum(jid)) ? HUMAN_PAUSE_PROSPECT_MIN * 60 * 1000 : HUMAN_PAUSE_HOURS * 3600 * 1000;
+        pausedUntil.set(jid, Date.now() + ms);
+        console.log(`⏸️ Você respondeu em ${jid}: Lumi pausado nessa conversa por ${Math.round(ms / 60000)} min.`);
       }, 2500);
       return;
     }
     if (type && type !== 'notify') return; // ignora histórico antigo sincronizado
 
     const num = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
-    if (IGNORE_NUMBERS.some((n) => num.endsWith(n))) { console.log(`🙈 ${num} está na lista de ignorados.`); return; }
+    if (IGNORE_NUMBERS.some((n) => num.endsWith(n)) || mesmoNum(estado.ignorados, num)) { console.log(`🙈 ${num} está na lista de ignorados.`); return; }
+    const isProspect = mesmoNum(estado.prospects, num);
     if (ONLY_NUMBERS.length && !ONLY_NUMBERS.some((n) => num.endsWith(n))) return;
     if ((pausedUntil.get(jid) || 0) > Date.now()) { console.log(`⏸️ Conversa ${jid} assumida por humano: Lumi quieto.`); return; }
 
@@ -331,6 +372,26 @@ async function startBot() {
     }
 
     if (!text) return; // ignora figurinha, imagem sem legenda etc (por enquanto)
+
+    // Pedido para parar: respeita na hora, para sempre, e te avisa.
+    if (OPTOUT_REGEX.test(text.trim())) {
+      if (!mesmoNum(estado.ignorados, num)) {
+        estado.ignorados.push(num);
+        estado.prospects = estado.prospects.filter((p) => !(num.endsWith(p) || p.endsWith(num)));
+        salvarEstado();
+      }
+      await sock.sendMessage(from, { text: 'Combinado! Não vou mais te chamar por aqui. Obrigado pela atenção e muito sucesso! 🙏' });
+      sendTelegramAlert(`🛑 ${num} pediu para não receber mais mensagens. Entrou na lista de ignorados.`);
+      return;
+    }
+
+    // Prospect demonstrou interesse ou pediu contato humano: alerta no Telegram.
+    if (isProspect && INTEREST_REGEX.test(text)) {
+      if (Date.now() - (alertaInteresse.get(num) || 0) > 3600 * 1000) {
+        alertaInteresse.set(num, Date.now());
+        sendTelegramAlert(`🔥 Prospect ${num} mostrou interesse ou pediu contato humano:\n"${text.slice(0, 300)}"\n\nAbra o WhatsApp e assuma. Para o Lumi ficar quieto nessa conversa, mande #humano ${num} no seu chat consigo mesmo.`);
+      }
+    }
 
     console.log(`📩 Mensagem de ${from}${isAudio ? ' (via áudio)' : ''}: ${text}`);
 
@@ -370,7 +431,7 @@ async function startBot() {
       const response = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001', // modelo rápido e barato, ideal pra chat
         max_tokens: 400,
-        system: SYSTEM_PROMPT,
+        system: isProspect ? PROSPECT_PROMPT : SYSTEM_PROMPT,
         messages: history,
       });
 
